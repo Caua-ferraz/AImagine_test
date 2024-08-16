@@ -35,10 +35,18 @@ def generate_text(model, tokenizer, prompt, device, max_length=100, temperature=
     model.eval()
     input_ids = tokenizer.encode(prompt, return_tensors='pt').to(device)
     
+    generated_tokens = []
     with torch.no_grad():
-        for _ in range(max_length):
+        for i in range(max_length):
             outputs = model(input_ids)
             next_token_logits = outputs[:, -1, :] / temperature
+            
+            # Debug: Print top 5 token probabilities
+            top_5_probs, top_5_indices = torch.topk(F.softmax(next_token_logits, dim=-1), 5)
+            print(f"Step {i+1}:")
+            for prob, idx in zip(top_5_probs[0], top_5_indices[0]):
+                print(f"  Token: {tokenizer.decode([idx])}, Probability: {prob.item():.4f}")
+            
             sorted_logits, sorted_indices = torch.sort(next_token_logits, descending=True)
             cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
             sorted_indices_to_remove = cumulative_probs > top_p
@@ -48,11 +56,14 @@ def generate_text(model, tokenizer, prompt, device, max_length=100, temperature=
             next_token_logits[:, indices_to_remove] = -float('Inf')
             probs = F.softmax(next_token_logits, dim=-1)
             next_token = torch.multinomial(probs, num_samples=1)
+            
+            generated_tokens.append(next_token.item())
             input_ids = torch.cat([input_ids, next_token], dim=-1)
             
             if next_token.item() == tokenizer.eos_token_id:
                 break
     
+    print(f"Generated tokens: {generated_tokens}")
     generated_text = tokenizer.decode(input_ids[0], skip_special_tokens=True)
     return generated_text
 
@@ -110,7 +121,7 @@ class TextGenerationGUI:
             vocab_size = self.tokenizer.vocab_size
 
             self.model = TransformerModel(vocab_size).to(self.device)
-            checkpoint = torch.load("model_checkpoint_epoch_20.pth", map_location=self.device) # chose model epoch
+            checkpoint = torch.load("model_checkpoint_epoch_60.pth", map_location=self.device) # chose model epoch
             self.model.load_state_dict(checkpoint['model_state_dict'])
             self.model.eval()
 
@@ -129,11 +140,14 @@ class TextGenerationGUI:
             self.output_text.insert(tk.END, "Invalid parameter values. Using defaults.\n")
             temperature, top_p, max_length = 1.0, 0.9, 100
 
-        generated_text = generate_text(self.model, self.tokenizer, prompt, self.device, 
-                                       max_length=max_length, temperature=temperature, top_p=top_p)
-        
         self.output_text.delete('1.0', tk.END)
         self.output_text.insert(tk.END, f"Prompt: {prompt}\n\n")
+        self.output_text.insert(tk.END, "Generating text...\n\n")
+        self.master.update()
+
+        generated_text = generate_text(self.model, self.tokenizer, prompt, self.device, 
+                                    max_length=max_length, temperature=temperature, top_p=top_p)
+        
         self.output_text.insert(tk.END, f"Generated text: {generated_text}\n")
 
 def main():

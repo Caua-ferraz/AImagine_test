@@ -33,7 +33,7 @@ The model uses techniques like nucleus sampling to balance between creativity an
 
 1. Clone the repository:
    ```
-   git clone https://github.com/yourusername/AImagine.git
+   https://github.com/Caua-ferraz/AImagine_test
    cd AImagine
    ```
 
