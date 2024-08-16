@@ -150,8 +150,8 @@ def main():
         print(f"CUDA Version: {torch.version.cuda}")  # Print CUDA version
 
     # Set hyperparameters
-    BATCH_SIZE = 8  # Number of samples processed before the model is updated
-    EPOCHS = 20  # Number of complete passes through the training dataset
+    BATCH_SIZE = 10  # Number of samples processed before the model is updated
+    EPOCHS = 60  # Number of complete passes through the training dataset
     LEARNING_RATE = 3e-4  # Step size at each iteration while moving toward a minimum of the loss function
     WARMUP_STEPS = 100  # Number of steps for the warmup phase of learning rate scheduler
 
