@@ -1,13 +1,19 @@
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, IterableDataset
 from transformers import GPT2Tokenizer, get_linear_schedule_with_warmup
 import numpy as np
 from tqdm import tqdm
 import os
 import warnings
-from ai_datasets import get_ai_texts
+from datasets import load_dataset
+import tkinter as tk
+from tkinter import ttk, scrolledtext
+import threading
+import time
+import traceback
+import random
 
 warnings.filterwarnings("ignore")
 
@@ -38,7 +44,7 @@ class TextDataset(Dataset):
         self.input_ids = []
         self.attn_masks = []
         
-        for text in texts:
+        for text in tqdm(texts, desc="Tokenizing texts"):
             encodings = tokenizer(text, truncation=True, max_length=max_length, padding="max_length")
             self.input_ids.append(torch.tensor(encodings['input_ids']))
             self.attn_masks.append(torch.tensor(encodings['attention_mask']))
@@ -49,12 +55,34 @@ class TextDataset(Dataset):
     def __getitem__(self, idx):
         return self.input_ids[idx], self.attn_masks[idx]
 
-def train(model, train_loader, optimizer, scheduler, criterion, device, scaler):
+class StreamingTextDataset(IterableDataset):
+    def __init__(self, dataset, tokenizer, split='train', max_length=512, split_ratio=0.9):
+        self.dataset = dataset
+        self.tokenizer = tokenizer
+        self.max_length = max_length
+        self.split = split
+        self.split_ratio = split_ratio
+
+    def __iter__(self):
+        for item in self.dataset[self.split]:
+            if self.split == 'train' and random.random() > self.split_ratio:
+                continue
+            if self.split == 'val' and random.random() <= self.split_ratio:
+                continue
+            text = f"Instruction: {item['instruction']}\nInput: {item['input']}\nOutput: {item['output']}"
+            encodings = self.tokenizer(text, truncation=True, max_length=self.max_length, padding="max_length")
+            yield {
+                'input_ids': torch.tensor(encodings['input_ids']),
+                'attention_mask': torch.tensor(encodings['attention_mask'])
+            }
+
+
+def train(model, train_loader, optimizer, scheduler, criterion, device, scaler, gui):
     model.train()
     total_loss = 0
     for batch in tqdm(train_loader, desc="Training"):
-        input_ids, attention_mask = batch
-        input_ids, attention_mask = input_ids.to(device), attention_mask.to(device)
+        input_ids = batch['input_ids'].to(device)
+        attention_mask = batch['attention_mask'].to(device)
         
         optimizer.zero_grad()
         
@@ -70,19 +98,21 @@ def train(model, train_loader, optimizer, scheduler, criterion, device, scaler):
         scheduler.step()
         
         total_loss += loss.item()
+        gui.update_loss(loss.item())
     return total_loss / len(train_loader)
 
-def evaluate(model, val_loader, criterion, device):
+def evaluate(model, val_loader, criterion, device, gui):
     model.eval()
     total_loss = 0
     with torch.no_grad():
         for batch in tqdm(val_loader, desc="Evaluating"):
-            input_ids, attention_mask = batch
-            input_ids, attention_mask = input_ids.to(device), attention_mask.to(device)
+            input_ids = batch['input_ids'].to(device)
+            attention_mask = batch['attention_mask'].to(device)
             
             outputs = model(input_ids)
             loss = criterion(outputs.view(-1, outputs.size(-1)), input_ids.view(-1))
             total_loss += loss.item()
+            gui.update_loss(loss.item())
     return total_loss / len(val_loader)
 
 def generate_text(model, tokenizer, prompt, max_length=100, temperature=0.7, top_k=50, device='cuda'):
@@ -105,79 +135,160 @@ def generate_text(model, tokenizer, prompt, max_length=100, temperature=0.7, top
     generated_text = tokenizer.decode(input_ids[0], skip_special_tokens=True)
     return generated_text
 
+
+class TrainingGUI:
+    def __init__(self, master):
+        self.master = master
+        master.title("AI Training Progress")
+        master.geometry("600x400")
+
+        self.progress_var = tk.DoubleVar()
+        self.epoch_var = tk.StringVar()
+        self.time_var = tk.StringVar()
+        self.loss_var = tk.StringVar()
+
+        self.create_widgets()
+
+    def create_widgets(self):
+        # Progress bar
+        ttk.Label(self.master, text="Training Progress:").pack(pady=10)
+        self.progress_bar = ttk.Progressbar(self.master, variable=self.progress_var, maximum=100)
+        self.progress_bar.pack(fill=tk.X, padx=20, pady=5)
+
+        # Info labels
+        info_frame = ttk.Frame(self.master)
+        info_frame.pack(fill=tk.X, padx=20, pady=10)
+
+        ttk.Label(info_frame, text="Epoch:").grid(row=0, column=0, sticky="w")
+        ttk.Label(info_frame, textvariable=self.epoch_var).grid(row=0, column=1, sticky="w")
+
+        ttk.Label(info_frame, text="Estimated Time:").grid(row=1, column=0, sticky="w")
+        ttk.Label(info_frame, textvariable=self.time_var).grid(row=1, column=1, sticky="w")
+
+        ttk.Label(info_frame, text="Current Loss:").grid(row=2, column=0, sticky="w")
+        ttk.Label(info_frame, textvariable=self.loss_var).grid(row=2, column=1, sticky="w")
+
+        # Console output
+        ttk.Label(self.master, text="Console Output:").pack(pady=10)
+        self.console = scrolledtext.ScrolledText(self.master, height=10)
+        self.console.pack(fill=tk.BOTH, expand=True, padx=20, pady=5)
+        self.console.tag_config('error', foreground='red')
+
+    def update_progress(self, progress):
+        self.progress_var.set(progress)
+
+    def update_epoch(self, epoch, total_epochs):
+        self.epoch_var.set(f"{epoch}/{total_epochs}")
+
+    def update_time(self, time_left):
+        self.time_var.set(time_left)
+
+    def update_loss(self, loss):
+        self.loss_var.set(f"{loss:.4f}")
+
+    def write_to_console(self, message, error=False):
+        tag = 'error' if error else 'normal'
+        self.console.insert(tk.END, message + "\n", tag)
+        self.console.see(tk.END)
+
 def main():
-    torch.manual_seed(42)
-    torch.cuda.manual_seed_all(42)
+    root = tk.Tk()
+    gui = TrainingGUI(root)
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {device}")
+    def training_thread():
+        try:
+            torch.manual_seed(42)
+            torch.cuda.manual_seed_all(42)
 
-    if device.type == 'cuda':
-        print(f"GPU: {torch.cuda.get_device_name(0)}")
-        print(f"CUDA Version: {torch.version.cuda}")
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            gui.write_to_console(f"Using device: {device}")
 
-    BATCH_SIZE = 16
-    EPOCHS = 60
-    LEARNING_RATE = 3e-4
-    WARMUP_STEPS = 500
+            if device.type == 'cuda':
+                gui.write_to_console(f"GPU: {torch.cuda.get_device_name(0)}")
+                gui.write_to_console(f"CUDA Version: {torch.version.cuda}")
 
-    tokenizer = GPT2Tokenizer.from_pretrained('gpt2')
-    tokenizer.pad_token = tokenizer.eos_token
-    vocab_size = tokenizer.vocab_size
+            BATCH_SIZE = 16
+            EPOCHS = 100
+            LEARNING_RATE = 3e-4
+            WARMUP_STEPS = 500
 
-    texts = get_ai_texts()
+            tokenizer = GPT2Tokenizer.from_pretrained('gpt2')
+            tokenizer.pad_token = tokenizer.eos_token
+            vocab_size = tokenizer.vocab_size
 
-    full_dataset = TextDataset(texts, tokenizer)
-    train_size = int(0.8 * len(full_dataset))
-    val_size = len(full_dataset) - train_size
-    train_dataset, val_dataset = torch.utils.data.random_split(full_dataset, [train_size, val_size])
+            gui.write_to_console("Loading dataset...")
+            ds = load_dataset("Replete-AI/Everything_Instruct_8k_context_filtered", cache_dir="./my_dataset_cache", streaming=True)
+            
+            gui.write_to_console("Preparing dataset...")
+            train_dataset = StreamingTextDataset(ds, tokenizer, split='train')
+            val_dataset = StreamingTextDataset(ds, tokenizer, split='val')
 
-    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, pin_memory=True, num_workers=2)
-    val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, pin_memory=True, num_workers=2)
+            train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, num_workers=2)
+            val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, num_workers=2)
 
-    model = TransformerModel(vocab_size).to(device)
+            model = TransformerModel(vocab_size).to(device)
 
-    criterion = nn.CrossEntropyLoss(ignore_index=tokenizer.pad_token_id)
-    optimizer = optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=0.01)
-    
-    total_steps = len(train_loader) * EPOCHS
-    scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=WARMUP_STEPS, num_training_steps=total_steps)
+            criterion = nn.CrossEntropyLoss(ignore_index=tokenizer.pad_token_id)
+            optimizer = optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=0.01)
+            
+            total_steps = 1000000 // BATCH_SIZE * EPOCHS  # Approximation
+            scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=WARMUP_STEPS, num_training_steps=total_steps)
 
-    scaler = torch.cuda.amp.GradScaler()
+            scaler = torch.cuda.amp.GradScaler()
 
-    os.makedirs("checkpoints", exist_ok=True)
+            os.makedirs("checkpoints", exist_ok=True)
 
-    best_val_loss = float('inf')
-    for epoch in range(EPOCHS):
-        train_loss = train(model, train_loader, optimizer, scheduler, criterion, device, scaler)
-        val_loss = evaluate(model, val_loader, criterion, device)
-        print(f"Epoch {epoch+1}/{EPOCHS}, Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}")
+            best_val_loss = float('inf')
+            start_time = time.time()
+            for epoch in range(EPOCHS):
+                train_loss = train(model, train_loader, optimizer, scheduler, criterion, device, scaler, gui)
+                val_loss = evaluate(model, val_loader, criterion, device, gui)
+                
+                gui.update_epoch(epoch + 1, EPOCHS)
+                gui.update_progress((epoch + 1) / EPOCHS * 100)
+                gui.update_loss(val_loss)
+                
+                elapsed_time = time.time() - start_time
+                estimated_total_time = elapsed_time / (epoch + 1) * EPOCHS
+                time_left = estimated_total_time - elapsed_time
+                gui.update_time(f"{time_left/3600:.2f} hours")
 
-        checkpoint_path = f"checkpoints/model_checkpoint_epoch_{epoch+1}.pth"
-        torch.save({
-            'epoch': epoch,
-            'model_state_dict': model.state_dict(),
-            'optimizer_state_dict': optimizer.state_dict(),
-            'train_loss': train_loss,
-            'val_loss': val_loss,
-        }, checkpoint_path)
-        print(f"Checkpoint saved: {checkpoint_path}")
+                gui.write_to_console(f"Epoch {epoch+1}/{EPOCHS}, Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}")
 
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
-            best_checkpoint_path = checkpoint_path
-            print(f"New best model saved: {best_checkpoint_path}")
-        
-        if epoch > 10 and val_loss > best_val_loss:
-            print("Early stopping")
-            break
+                checkpoint_path = f"checkpoints/model_checkpoint_epoch_{epoch+1}.pth"
+                torch.save({
+                    'epoch': epoch,
+                    'model_state_dict': model.state_dict(),
+                    'optimizer_state_dict': optimizer.state_dict(),
+                    'train_loss': train_loss,
+                    'val_loss': val_loss,
+                }, checkpoint_path)
+                gui.write_to_console(f"Checkpoint saved: {checkpoint_path}")
 
-    print("Training completed!")
-    checkpoint = torch.load(best_checkpoint_path)
-    model.load_state_dict(checkpoint['model_state_dict'])
-    prompt = "Artificial intelligence is"
-    generated_text = generate_text(model, tokenizer, prompt, device=device)
-    print(f"Generated text: {generated_text}")
+                if val_loss < best_val_loss:
+                    best_val_loss = val_loss
+                    best_checkpoint_path = checkpoint_path
+                    gui.write_to_console(f"New best model saved: {best_checkpoint_path}")
+                
+                if epoch > 10 and val_loss > best_val_loss:
+                    gui.write_to_console("Early stopping")
+                    break
+
+            gui.write_to_console("Training completed!")
+            checkpoint = torch.load(best_checkpoint_path)
+            model.load_state_dict(checkpoint['model_state_dict'])
+            prompt = "Instruction: Explain what artificial intelligence is\nInput: \nOutput:"
+            generated_text = generate_text(model, tokenizer, prompt, device=device)
+            gui.write_to_console(f"Generated text: {generated_text}")
+
+        except Exception as e:
+            error_message = f"An error occurred: {str(e)}\n{traceback.format_exc()}"
+            gui.write_to_console(error_message, error=True)
+
+    # Start the training in a separate thread
+    threading.Thread(target=training_thread, daemon=True).start()
+
+    root.mainloop()
 
 if __name__ == "__main__":
     main()
