@@ -18,12 +18,13 @@ class TransformerModel(nn.Module):
         self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
         self.fc_out = nn.Linear(d_model, vocab_size)
 
-    def forward(self, src):
+    def forward(self, src, past_key_values=None):
         pos = torch.arange(0, src.size(1)).unsqueeze(0).repeat(src.size(0), 1).to(src.device)
         src_embed = self.embedding(src) + self.pos_encoder(pos)
         src_mask = self.generate_square_subsequent_mask(src.size(1)).to(src.device)
         out = self.transformer(src_embed, src_mask)
-        return self.fc_out(out)
+        logits = self.fc_out(out)
+        return logits  # We're not returning past_key_values as they're not used in this simple model
 
     def generate_square_subsequent_mask(self, sz):
         mask = (torch.triu(torch.ones(sz, sz)) == 1).transpose(0, 1)
@@ -31,40 +32,39 @@ class TransformerModel(nn.Module):
         return mask
 
 # generate_text function (same as before)
-def generate_text(model, tokenizer, prompt, device, max_length=100, temperature=1.0, top_p=0.9):
+def generate_text(model, tokenizer, prompt, max_length=100, temperature=0.7, top_p=0.9, repetition_penalty=1.2, device='cuda'):
     model.eval()
     input_ids = tokenizer.encode(prompt, return_tensors='pt').to(device)
     
-    generated_tokens = []
-    with torch.no_grad():
-        for i in range(max_length):
-            outputs = model(input_ids)
+    generated_ids = input_ids
+    
+    for _ in range(max_length):
+        with torch.no_grad():
+            outputs = model(generated_ids)
             next_token_logits = outputs[:, -1, :] / temperature
             
-            # Debug: Print top 5 token probabilities
-            top_5_probs, top_5_indices = torch.topk(F.softmax(next_token_logits, dim=-1), 5)
-            print(f"Step {i+1}:")
-            for prob, idx in zip(top_5_probs[0], top_5_indices[0]):
-                print(f"  Token: {tokenizer.decode([idx])}, Probability: {prob.item():.4f}")
+            # Apply repetition penalty
+            for i in range(generated_ids.shape[1]):
+                next_token_logits[0, generated_ids[0, i]] /= repetition_penalty
             
+            # Apply nucleus (top-p) sampling
             sorted_logits, sorted_indices = torch.sort(next_token_logits, descending=True)
-            cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
+            cumulative_probs = torch.cumsum(torch.softmax(sorted_logits, dim=-1), dim=-1)
             sorted_indices_to_remove = cumulative_probs > top_p
             sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
             sorted_indices_to_remove[..., 0] = 0
             indices_to_remove = sorted_indices[sorted_indices_to_remove]
-            next_token_logits[:, indices_to_remove] = -float('Inf')
-            probs = F.softmax(next_token_logits, dim=-1)
+            next_token_logits[:, indices_to_remove] = -float('inf')
+            
+            probs = torch.softmax(next_token_logits, dim=-1)
             next_token = torch.multinomial(probs, num_samples=1)
             
-            generated_tokens.append(next_token.item())
-            input_ids = torch.cat([input_ids, next_token], dim=-1)
+            generated_ids = torch.cat([generated_ids, next_token], dim=-1)
             
             if next_token.item() == tokenizer.eos_token_id:
                 break
     
-    print(f"Generated tokens: {generated_tokens}")
-    generated_text = tokenizer.decode(input_ids[0], skip_special_tokens=True)
+    generated_text = tokenizer.decode(generated_ids[0], skip_special_tokens=True)
     return generated_text
 
 class TextGenerationGUI:
@@ -121,7 +121,7 @@ class TextGenerationGUI:
             vocab_size = self.tokenizer.vocab_size
 
             self.model = TransformerModel(vocab_size).to(self.device)
-            checkpoint = torch.load("model_checkpoint_epoch_60.pth", map_location=self.device) # chose model epoch
+            checkpoint = torch.load("model_checkpoint_epoch_20.pth", map_location=self.device) # chose model epoch
             self.model.load_state_dict(checkpoint['model_state_dict'])
             self.model.eval()
 
@@ -138,15 +138,23 @@ class TextGenerationGUI:
             max_length = int(self.max_length_entry.get())
         except ValueError:
             self.output_text.insert(tk.END, "Invalid parameter values. Using defaults.\n")
-            temperature, top_p, max_length = 1.0, 0.9, 100
+            temperature, top_p, max_length = 0.7, 0.9, 100
 
         self.output_text.delete('1.0', tk.END)
         self.output_text.insert(tk.END, f"Prompt: {prompt}\n\n")
         self.output_text.insert(tk.END, "Generating text...\n\n")
         self.master.update()
 
-        generated_text = generate_text(self.model, self.tokenizer, prompt, self.device, 
-                                    max_length=max_length, temperature=temperature, top_p=top_p)
+        generated_text = generate_text(
+            model=self.model,
+            tokenizer=self.tokenizer,
+            prompt=prompt,
+            max_length=max_length,
+            temperature=temperature,
+            top_p=top_p,
+            repetition_penalty=1.2,
+            device=self.device
+        )
         
         self.output_text.insert(tk.END, f"Generated text: {generated_text}\n")
 
