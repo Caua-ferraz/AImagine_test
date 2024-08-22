@@ -1,5 +1,15 @@
 # AImagine: AI-Powered Text Generation
 
+## ALERTS: as this repo is not only beta but aswel not tested in other computers it may have some errors including:
+-Fatal errors as path not recognizing or dependencies not installing
+-deprecated packages/function
+-unfuctional dataset as huggingface can modify his API
+-failed codes as it still unready to Public use that's why we still having no versions
+
+## feel free to use, if u found any bug please alert me 
+
+
+
 AImagine is an innovative text generation tool that harnesses the power of artificial intelligence to create AI-focused content. Built on a custom transformer architecture, this project aims to generate coherent and insightful text about various aspects of AI, from machine learning algorithms to ethical considerations.
 
 ## Table of Contents
